@@ -4,7 +4,10 @@ var SUGGESTIONS_LIMIT = 6
 var FALLBACKS = [
   { id: "fallback:google", title: "Search Google", icon: "", url: "https://www.google.com/search?q={query}" },
   { id: "fallback:duckduckgo", title: "Search DuckDuckGo", icon: "", url: "https://duckduckgo.com/?q={query}" },
-  { id: "fallback:agent", title: "Ask default agent", icon: "󰚩", subtitle: "New terminal session · Ctrl+Alt+Enter" }
+  { id: "fallback:agent", title: "Ask default agent", icon: "󰚩", subtitle: "New terminal session · Ctrl+Alt+Enter" },
+  { id: "fallback:bing", title: "Search Bing", icon: "", url: "https://www.bing.com/search?q={query}", enabledByDefault: false },
+  { id: "fallback:quicklinks", title: "Search Quicklinks", icon: "", view: "quicklinks", enabledByDefault: false },
+  { id: "fallback:scripts", title: "Search Script Commands", icon: "", view: "scripts", enabledByDefault: false }
 ]
 
 // Web searches as root commands with an inline argument pill (ref 04 §2.2
@@ -24,6 +27,18 @@ function webSearch(fallback, keywords) {
 var BUILTINS = [
   webSearch(FALLBACKS[0], []),
   webSearch(FALLBACKS[1], ["ddg"]),
+  webSearch(FALLBACKS[3], ["bing"]),
+  { id: "builtin:settings", title: "Settings", subtitle: "oma-cast", keywords: ["preferences", "configure"], run: { settings: "general" } },
+  { id: "builtin:launcher-settings", title: "Launcher Settings", keywords: ["fallback", "search sensitivity"], run: { settings: "launcher" } },
+  { id: "builtin:keyboard-settings", title: "Keyboard Settings", keywords: ["navigation", "escape", "hotkeys"], run: { settings: "keyboard" } },
+  { id: "builtin:command-settings", title: "Manage Commands", keywords: ["aliases", "enable", "disable", "extensions", "shortcuts"], run: { settings: "commands" } },
+  { id: "builtin:create-quicklink", title: "Create Quicklink", keywords: ["new", "url", "bookmark"], run: { quicklinks: "create" } },
+  { id: "builtin:search-quicklinks", title: "Search Quicklinks", keywords: ["links", "bookmarks"], run: { push: { kind: "quicklinks", title: "Quicklinks" } } },
+  { id: "builtin:import-quicklinks", title: "Import Quicklinks", keywords: ["links", "json"], run: { quicklinks: "import" } },
+  { id: "builtin:export-quicklinks", title: "Export Quicklinks", keywords: ["links", "backup"], run: { quicklinks: "export" } },
+  { id: "builtin:create-script", title: "Create Script Command", keywords: ["new", "script", "template"], run: { scriptEditor: true } },
+  { id: "builtin:search-scripts", title: "Search Script Commands", keywords: ["scripts", "automation"], run: { push: { kind: "scripts", title: "Script Commands" } } },
+  { id: "builtin:reload-scripts", title: "Reload Script Commands", keywords: ["scripts", "refresh", "rescan"], run: { reloadScripts: true } },
   {
     id: "builtin:omarchy-menu",
     title: "Omarchy Menu",
@@ -190,6 +205,7 @@ function decorate(candidate, ctx, deps) {
   var visits = (ctx.frecency && ctx.frecency[candidate.id]) || null
   out.alias = settings.alias ? String(settings.alias).toLowerCase() : ""
   out.favoriteOrder = typeof settings.favoriteOrder === "number" ? settings.favoriteOrder : null
+  out.hotkey = settings.hotkey || null
   out.frecency = visits ? deps.Frecency.score(visits.anchor, ctx.nowMs / 1000) : 1
   out.openedAt = visits ? visits.openedAt : null
   out.searchTerms = visits && visits.searchTerms ? visits.searchTerms : []
@@ -205,15 +221,55 @@ function rankOptions(ctx) {
   return { sensitivity: ctx.sensitivity || "medium", nowMs: ctx.nowMs, fleaHits: ctx.fleaHits || null }
 }
 
-function fallbackRows(query) {
-  return FALLBACKS.map(function(f) {
-    return {
-      candidate: {
-        id: f.id, type: "command", kind: "fallback", title: f.title, subtitle: f.subtitle || query,
-        typeLabel: "Fallback", glyph: f.icon, url: f.url, rootSearch: { when: "searching" }
-      },
-      record: null
+function fallbackCommands(candidates) {
+  var available = FALLBACKS.slice()
+  ;(candidates || []).forEach(function(c) {
+    if (c.kind === "quicklink" && c.arguments && c.arguments.length === 1) {
+      available.push({ id: "fallback:command:" + c.id, title: c.title, icon: c.glyph || "",
+        targetId: c.id, argument: c.arguments[0].name, enabledByDefault: false })
     }
+  })
+  return available
+}
+
+function enabledFallbacks(candidates, ctx) {
+  var available = fallbackCommands(candidates)
+  var order = Array.isArray(ctx.fallbackIds) ? ctx.fallbackIds
+    : available.filter(function(f) { return f.enabledByDefault !== false }).map(function(f) { return f.id })
+  var byId = {}
+  available.forEach(function(f) { byId[f.id] = f })
+  return order.filter(function(id, index) {
+    var f = byId[id]
+    return !!f && order.indexOf(id) === index
+      && !(f.targetId && ctx.commands && ctx.commands[f.targetId] && ctx.commands[f.targetId].enabled === false)
+  }).map(function(id) { return byId[id] })
+}
+
+function fallbackRows(query, candidates, ctx) {
+  return enabledFallbacks(candidates, ctx).map(function(f) {
+    return { candidate: {
+      id: f.id, type: "command", kind: "fallback", title: f.title, subtitle: f.subtitle || query,
+      typeLabel: "Fallback", glyph: f.icon, url: f.url, rootSearch: { when: "searching" }
+    }, record: null }
+  })
+}
+
+// URLs remain inert until explicitly selected. Only browser-safe schemes are offered.
+function queryUrl(query) {
+  var value = String(query || "").trim()
+  if (/^www\./i.test(value)) value = "https://" + value
+  return /^https?:\/\/[^/?#\s]+(?:[/?#][^\s]*)?$/i.test(value) ? value : ""
+}
+
+function urlRows(query) {
+  var url = queryUrl(query)
+  if (!url) return []
+  return [
+    { id: "url:open", title: "Open in Browser" },
+    { id: "url:create-quicklink", title: "Create Quicklink" }
+  ].map(function(row) {
+    return { candidate: { id: row.id, type: "command", kind: "url", title: row.title,
+      subtitle: url, url: url, glyph: "", typeLabel: "URL", rootSearch: { when: "searching" } }, record: null }
   })
 }
 
@@ -291,9 +347,16 @@ function rootSections(candidates, query, ctx, deps) {
     var searchable = decorated.filter(function(c) { return c.rootSearch.when !== "empty" })
     var results = deps.Ranker.rank(searchable, q, opts)
     var sections = []
+    if (!filtered) {
+      var urls = urlRows(q)
+      if (urls.length) sections.push({ id: "url", title: "URL", rows: urls })
+    }
     if (ctx.calculation && !filtered) sections.push({ id: "calculator", title: "Calculator", rows: [{ candidate: calculatorCandidate(ctx.calculation), record: null }] })
     if (results.length > 0) sections.push({ id: "results", title: "Results", rows: results })
-    if (!filtered) sections.push({ id: "fallback-commands", title: "Use “" + q + "” with…", rows: fallbackRows(q) })
+    if (!filtered) {
+      var fallbacks = fallbackRows(q, candidates, ctx)
+      if (fallbacks.length) sections.push({ id: "fallback-commands", title: "Use “" + q + "” with…", rows: fallbacks })
+    }
     return sections
   }
 
@@ -335,6 +398,13 @@ function submenuSections(candidates, menuId, query, ctx, deps) {
   return ranked.length ? [{ id: "results", title: "Results", rows: ranked }] : []
 }
 
+function providerSections(candidates, kind, query, ctx, deps) {
+  var entries = candidates.filter(function(c) { return c.kind === kind && isEnabled(c, ctx) })
+    .map(function(c) { return decorate(c, ctx, deps) })
+  var results = deps.Ranker.rank(entries, String(query || "").trim(), rankOptions(ctx))
+  return results.length ? [{ id: kind, title: "", rows: results }] : []
+}
+
 function actionsFor(candidate) {
   if (candidate.kind === "calculator" || candidate.kind === "calculator-history") {
     // ↵ copies, Ctrl ↵ pastes (SPEC §8 Calculator) [O]; delete keys are
@@ -359,6 +429,10 @@ function actionsFor(candidate) {
     case "omarchy-action": primary = { id: "open", title: "Run", icon: "" }; break
     case "omarchy-menu":
     case "omarchy-link": primary = { id: "open", title: "Open Menu", icon: "" }; break
+    case "quicklink": primary = { id: "open", title: "Open Quicklink", icon: "" }; break
+    case "script": primary = { id: "open", title: "Run Script", icon: "" }; break
+    case "system-action": primary = { id: "open", title: candidate.title, icon: "" }; break
+    case "url": primary = { id: "open", title: candidate.title, icon: "" }; break
     case "fallback": primary = { id: "open", title: candidate.title, icon: "" }; break
     default: primary = { id: "open", title: "Open Command", icon: "" }
   }
@@ -368,7 +442,7 @@ function actionsFor(candidate) {
 
   if (candidate.kind && candidate.kind.indexOf("omarchy-") === 0)
     list.push({ id: "open-in-omarchy-menu", title: "Open in Omarchy Menu", shortcut: "Ctrl ↵", section: "primary", icon: "" })
-  if (candidate.kind === "fallback") return list
+  if (candidate.kind === "fallback" || candidate.kind === "url") return list
 
   if (candidate.kind === "app") list.push({ id: "open-new", title: "Open New Window", shortcut: "Shift ↵", section: "primary", icon: "" })
   if (candidate.kind === "app") list.push({ id: "copy-id", title: "Copy Desktop ID", shortcut: "Ctrl Shift C", section: "copy", icon: "" })
@@ -383,6 +457,7 @@ function actionsFor(candidate) {
   }
   list.push({ id: "set-alias", title: candidate.alias ? "Change Alias" : "Set Alias", shortcut: "", section: "configure", icon: "" })
   if (candidate.alias) list.push({ id: "remove-alias", title: "Remove Alias", shortcut: "", section: "configure", icon: "" })
+  list.push({ id: "configure", title: "Configure Command", shortcut: "Ctrl Shift ,", section: "configure", icon: "" })
   if (candidate.frecency > 1) list.push({ id: "reset-ranking", title: "Reset Ranking", shortcut: "", section: "configure", icon: "" })
   list.push({ id: "disable", title: "Disable Command", shortcut: "Alt Shift D", section: "delete", icon: "" })
   return list
@@ -479,6 +554,11 @@ if (typeof module !== "undefined") {
     SUGGESTIONS_LIMIT: SUGGESTIONS_LIMIT,
     FALLBACKS: FALLBACKS,
     BUILTINS: BUILTINS,
+    fallbackCommands: fallbackCommands,
+    enabledFallbacks: enabledFallbacks,
+    queryUrl: queryUrl,
+    urlRows: urlRows,
+    providerSections: providerSections,
     FILTERS: FILTERS,
     fillArguments: fillArguments,
     missingArgument: missingArgument,

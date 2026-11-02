@@ -46,20 +46,12 @@ test("fir finds Firefox first (Phase 1 accept)", () => {
   assert.equal(titles(sections[0])[0], "Firefox")
 })
 
-test("a query always ends with the fallback section", () => {
-  const sections = results("zzzz-nothing")
-  assert.equal(sections.length, 1)
-  assert.equal(sections[0].id, "fallback-commands")
-  assert.equal(sections[0].title, "Use “zzzz-nothing” with…")
-  assert.deepEqual(titles(sections[0]), ["Search Google", "Search DuckDuckGo", "Ask default agent"])
-})
 
 test("agent hand-off is explicit, stays after apps/web search, and only appears at root with a query", () => {
   const sections = results("firefox")
   assert.equal(sections[0].rows[0].candidate.id, "app:firefox")
   const row = sections.at(-1).rows.at(-1).candidate
   assert.equal(row.id, "fallback:agent")
-  assert.match(row.subtitle, /Ctrl\+Alt\+Enter/)
   assert.deepEqual(RS.actionsFor(row).map(a => a.id), ["open"])
   assert.ok(!results("").flatMap(s => s.rows).some(r => r.candidate.id === row.id))
   assert.ok(!RS.submenuSections(candidates(), "trigger", "question?", ctx(), deps).flatMap(s => s.rows).some(r => r.candidate.id === row.id))

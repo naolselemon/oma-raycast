@@ -11,6 +11,9 @@ Item {
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
   property var manifest: null
+  property string ipcTarget: "oma-cast"
+  property string ipcConfigPath: ""
+  property var pathOverrides: null
 
   readonly property string pluginId: (root.manifest && root.manifest.id) || "typecraft.oma-cast"
 
@@ -56,23 +59,32 @@ Item {
   }
 
   function run(commandId) {
-    // `oma-cast run` is explicit, so it skips the confirmation alert.
-    var r = backend.callSync("rootSearch.performAction", { id: commandId, action: "open", query: "", confirmed: true })
+    var candidate = backend.decorated(commandId)
+    if (!candidate) return { ok: false, error: "Unknown command " + commandId }
+    var settings = backend.callSync("settings.getCommandSettings", { commandId: commandId })
+    if (settings.ok && settings.data.enabled === false) return { ok: false, error: "Command is disabled" }
+    if (candidate.arguments && candidate.arguments.length) {
+      var prefs = backend.callSync("settings.getQuicklinkPreferences", {})
+      if (candidate.kind === "quicklink" && candidate.arguments.length === 1 && prefs.ok && prefs.data.passSelectedTextAsArgument)
+        return backend.callSync("rootSearch.performAction", { id: commandId, action: "open", query: "", hotkey: true })
+      root.show()
+      launcher.promptCommand(candidate)
+      return { ok: true, data: { prompted: true } }
+    }
+    // Explicit command invocation skips power alerts; scripts keep their own confirmation.
+    var r = backend.callSync("rootSearch.performAction", { id: commandId, action: "open", query: "", confirmed: candidate.kind !== "script" })
     if (!r.ok) return r
     var outcome = r.data || {}
-    if (outcome.push) {
-      root.show()
-      launcher.popToRoot()
-      launcher.push(outcome.push)
-    } else if (outcome.close) {
-      root.hide()
-      if (outcome.hud) launcher.hud(outcome.hud)
-    }
+    if (outcome.push || outcome.confirm) root.show()
+    launcher.applyOutcome(outcome, { id: commandId, action: "open", query: "" })
     return r
   }
 
   Backend {
     id: backend
+    ipcTarget: root.ipcTarget
+    ipcConfigPath: root.ipcConfigPath
+    pathOverrides: root.pathOverrides
     appLibrary: root.shell ? root.shell.appLibrary : null
     summon: function(id, payload) { return root.shell ? root.shell.summon(id, payload) : false }
   }
@@ -80,10 +92,23 @@ Item {
   Connections {
     target: backend
     function onNotification(method, data) {
-      if (method !== "agent.launchReady") return
-      root.hide()
-      launcher.popToRoot()
-      Util.execArgv(data.argv)
+      if (method === "agent.launchReady") {
+        root.hide()
+        launcher.popToRoot()
+        Util.execArgv(data.argv)
+      } else if (method === "settings.openRequested") {
+        root.hide()
+        settingsWindow.open(data.page || "general", data.commandId || "")
+      } else if (method === "quicklinks.openRequested") {
+        root.hide()
+        quicklinksWindow.open(data)
+      } else if (method === "scriptCommands.createRequested") {
+        root.hide()
+        scriptWindow.open(data || {})
+      } else if (method === "general.closeMainWindow") {
+        root.hide()
+        launcher.popToRoot()
+      }
     }
   }
 
@@ -95,15 +120,19 @@ Item {
     onDismissRequested: root.hide()
   }
 
+  SettingsWindow { id: settingsWindow; backend: backend }
+  QuicklinksWindow { id: quicklinksWindow; backend: backend }
+  ScriptCommandWindow { id: scriptWindow; backend: backend }
+
   GlobalShortcut {
-    appid: "oma-cast"
+    appid: root.ipcTarget
     name: "toggle"
     description: "Toggle oma-cast"
     onPressed: root.toggle()
   }
 
   IpcHandler {
-    target: "oma-cast"
+    target: root.ipcTarget
 
     function toggle(): string {
       root.toggle()
@@ -112,6 +141,19 @@ Item {
 
     function show(): string {
       root.show()
+      return "shown"
+    }
+
+    function search(query: string): string {
+      root.show()
+      launcher.popToRoot()
+      launcher.setQuery(query)
+      return "shown"
+    }
+
+    function settings(page: string): string {
+      root.hide()
+      settingsWindow.open(page || "general", "")
       return "shown"
     }
 

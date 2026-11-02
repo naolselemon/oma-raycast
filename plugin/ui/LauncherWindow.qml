@@ -1,5 +1,7 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
+import Quickshell.Hyprland
 import Quickshell.Wayland
 import qs.Commons
 import qs.Commons as Commons
@@ -34,13 +36,22 @@ PanelWindow {
 
   signal dismissRequested()
 
-  visible: window.shown
+  visible: window.shown && window.screenReady
+  property bool screenReady: false
+  property var targetScreen: Quickshell.screens.length ? Quickshell.screens[0] : null
+  property string screenMode: "mouse-screen"
+  property string screenInfo: ""
+  screen: window.targetScreen
   anchors { top: true; bottom: true; left: true; right: true }
   color: "transparent"
   exclusionMode: ExclusionMode.Ignore
-  WlrLayershell.namespace: "oma-cast"
+  WlrLayershell.namespace: window.backend.ipcTarget
   WlrLayershell.layer: WlrLayer.Overlay
   WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+  onBackingWindowVisibleChanged: {
+    if (window.backingWindowVisible && window.shown)
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
 
   readonly property var general: {
     window.backend.storeRevision
@@ -86,6 +97,7 @@ PanelWindow {
   property var argValues: ({})
   property int argFocus: -1
   property string argsForId: ""
+  property string pendingCommandId: ""
 
   // Navigation bindings (ref 04 §2.8): emacs moves with Ctrl+N (Ctrl+P is the
   // dropdown); vim-motions with Ctrl+J/K, which moves the action panel to
@@ -96,9 +108,21 @@ PanelWindow {
 
   readonly property bool atRoot: window.stack.length === 1
   readonly property bool compact: window.general.windowMode === "compact" && window.atRoot && !window.query
+  readonly property var compactFavorites: {
+    window.backend.storeRevision
+    window.backend.candidatesRevision
+    if (!window.compact || !window.general.showFavoritesInCompactMode || !window.backend.ready) return []
+    var result = window.backend.callSync("rootSearch.search", { query: "" })
+    if (!result.ok) return []
+    var section = result.data.filter(function(s) { return s.id === "favorites" })[0]
+    return section ? section.rows : []
+  }
   readonly property string placeholder: window.view.kind === "alias" ? "Type an alias, then press ↵"
     : window.view.kind === "menu" ? "Search " + window.view.title + "…"
     : window.view.kind === "calculator-history" ? "Search calculations…"
+    : window.view.kind === "script-output" ? window.view.title
+    : window.view.kind === "quicklinks" ? "Search quicklinks…"
+    : window.view.kind === "scripts" ? "Search script commands…"
     : "Search for apps and commands…"
 
   readonly property int cardWidth: Math.min(px(750), width - Style.gapsOut * 2)
@@ -122,8 +146,69 @@ PanelWindow {
     window.alert = null
   }
 
+  function focusedScreen() {
+    var name = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
+    for (var i = 0; i < Quickshell.screens.length; i++)
+      if (Quickshell.screens[i].name === name) return Quickshell.screens[i]
+    return Quickshell.screens.length ? Quickshell.screens[0] : null
+  }
+
+  function chooseScreen() {
+    window.targetScreen = window.focusedScreen()
+    window.screenMode = window.general.windowPresentationMode || "mouse-screen"
+    // Wayland has no primary-output designation: the first Qt output is our primary. [D]
+    if (Quickshell.screens.length <= 1 || window.screenMode === "primary-screen") {
+      window.targetScreen = Quickshell.screens.length ? Quickshell.screens[0] : null
+      window.screenReady = true
+      return
+    }
+    window.screenInfo = ""
+    if (!screenProbe.running) {
+      screenProbe.command = ["hyprctl", "-j", window.screenMode === "active-screen" ? "activewindow" : "cursorpos"]
+      screenProbe.running = true
+    }
+  }
+
+  Process {
+    id: screenProbe
+    stdout: StdioCollector { onStreamFinished: window.screenInfo = text }
+    onExited: function(code) {
+      if (code === 0) {
+        try {
+          var info = JSON.parse(window.screenInfo)
+          var monitors = Hyprland.monitors.values
+          for (var i = 0; i < Quickshell.screens.length; i++) {
+            var output = Quickshell.screens[i]
+            if (window.screenMode === "mouse-screen" && info.x >= output.x && info.x < output.x + output.width
+                && info.y >= output.y && info.y < output.y + output.height) window.targetScreen = output
+            if (window.screenMode === "active-screen") {
+              for (var j = 0; j < monitors.length; j++)
+                if (monitors[j].id === info.monitor && monitors[j].name === output.name) window.targetScreen = output
+            }
+          }
+        } catch (e) { window.backend.log("warn", "screen", String(e)) }
+      }
+      window.screenReady = true
+    }
+  }
+
+  Connections {
+    target: Quickshell
+    function onScreensChanged() {
+      if (window.shown && Quickshell.screens.indexOf(window.targetScreen) < 0) window.chooseScreen()
+    }
+  }
+
+  function promptCommand(candidate) {
+    window.popToRoot()
+    window.query = candidate.title
+    window.pendingCommandId = candidate.id
+    window.rebuild(true)
+  }
+
   function prepare(payload) {
     popTimer.stop()
+    window.chooseScreen()
     if (typeof payload.query === "string") window.query = payload.query
     window.closePopups()
     window.historyIndex = -1
@@ -133,6 +218,7 @@ PanelWindow {
 
   onShownChanged: {
     if (window.shown) return
+    window.screenReady = false
     window.searchSerial++
     window.backend.cancelSearch()
     window.searchPending = false
@@ -159,7 +245,7 @@ PanelWindow {
     var saved = window.stack.slice()
     saved[saved.length - 1] = Object.assign({}, window.view, { query: window.query, selectedIndex: window.selectedIndex })
     window.stack = saved.concat([next])
-    window.query = next.kind === "alias" ? (next.value || "") : ""
+    window.query = next.kind === "alias" ? (next.value || "") : (next.query || "")
     window.rebuild(true)
   }
 
@@ -179,7 +265,7 @@ PanelWindow {
     pointerGate.reset()
     var keepId = !resetSelection && window.selectedRow ? window.selectedRow.itemId : ""
     window.searchPending = false
-    if (window.view.kind === "alias") { Rows.update(rows, []); window.select(-1); return }
+    if (window.view.kind === "alias" || window.view.kind === "script-output") { Rows.update(rows, []); window.select(-1); return }
     window.searchPending = true
     var revision = window.backend.candidatesRevision
     window.backend.searchAsync({ query: window.query, view: window.view, filter: window.atRoot ? window.rootFilter : "all" }, function(result) {
@@ -202,13 +288,18 @@ PanelWindow {
       if (section.title || s > 0) next.push(window.rowData({ id: "section:" + section.id, title: section.title }, "section"))
       for (var r = 0; r < section.rows.length; r++) {
         var c = section.rows[r]
-        if (c.id === keepId) keepIndex = next.length
+        if (c.id === (window.pendingCommandId || keepId)) keepIndex = next.length
         next.push(window.rowData(c, c.kind === "calculator" ? "calculator" : "item"))
       }
     }
     Rows.update(rows, next)
     if (restoreIndex >= 0 && restoreIndex < rows.count && window.isSelectable(restoreIndex)) window.select(restoreIndex)
     else window.select(keepIndex >= 0 ? keepIndex : window.nextSelectable(-1, 1))
+    if (window.pendingCommandId) {
+      window.pendingCommandId = ""
+      window.argFocus = RootSearch.missingArgument(window.argDefs, window.argValues)
+      if (window.argFocus < 0 && window.argDefs.length) window.argFocus = 0
+    }
   }
 
   function rowData(c, kind) {
@@ -255,12 +346,18 @@ PanelWindow {
     window.selectedRow = Rows.snapshot(rows, index)
     // Argument values belong to one command; a different row starts empty.
     var id = window.selectedRow ? window.selectedRow.itemId : ""
+    var definitions = window.selectedRow && window.selectedRow.argsJson ? JSON.parse(window.selectedRow.argsJson) : []
     if (id !== window.argsForId) {
       window.argsForId = id
-      window.argValues = ({})
+      var values = {}
+      definitions.forEach(function(def) {
+        var value = def.defaultValue !== undefined ? def.defaultValue : def.default
+        if (value !== undefined) values[def.name] = String(value)
+      })
+      window.argValues = values
       window.argFocus = -1
     }
-    window.argDefs = window.selectedRow && window.selectedRow.argsJson ? JSON.parse(window.selectedRow.argsJson) : []
+    window.argDefs = definitions
     if (index >= 0) list.positionViewAtIndex(index, ListView.Contain)
     if (index === window.nextSelectable(-1, 1)) list.positionViewAtBeginning()
   }
@@ -301,7 +398,7 @@ PanelWindow {
 
   function actionsForSelected() {
     if (window.searchPending || !window.selectedRow) return []
-    var r = window.backend.callSync("rootSearch.getActions", { id: window.selectedRow.itemId })
+    var r = window.backend.callSync("rootSearch.getActions", { id: window.selectedRow.itemId, query: window.query })
     return r.ok ? r.data : []
   }
 
@@ -321,7 +418,13 @@ PanelWindow {
   function request(payload) {
     var r = window.backend.callSync("rootSearch.performAction", payload)
     if (!r.ok) { window.showToast("failure", r.error); return }
-    var outcome = r.data || {}
+    window.applyOutcome(r.data || {}, payload)
+  }
+
+  function applyOutcome(outcome, payload) {
+    if (outcome.settings) { window.backend.emit("settings.openRequested", outcome.settings); return }
+    if (outcome.quicklinks) { window.backend.emit("quicklinks.openRequested", outcome.quicklinks); return }
+    if (outcome.scriptEditor) { window.backend.emit("scriptCommands.createRequested", outcome.scriptEditor); return }
     if (outcome.confirm) { window.alert = { spec: outcome.confirm, payload: payload }; return }
     if (outcome.push) { window.push(outcome.push); return }
     if (outcome.close) {
@@ -425,10 +528,43 @@ PanelWindow {
       window.argFocus = next >= window.argDefs.length ? 0 : next
       return true
     }
+    if (def.type === "dropdown") {
+      if (key === Qt.Key_Down || key === Qt.Key_Up || key === Qt.Key_Space) {
+        window.cycleArgument(window.argFocus, key === Qt.Key_Up ? -1 : 1)
+        return true
+      }
+      return key !== Qt.Key_Return && key !== Qt.Key_Enter && key !== Qt.Key_Escape
+    }
     if (key === Qt.Key_Backspace && !value) { window.argFocus--; return true }
     if (Util.editsFilter(event, value)) { set(Util.editedFilter(event, value)); return true }
     if (window.isTyping(event)) { set(value + event.text); return true }
     return false
+  }
+
+  function argumentOptions(def) {
+    return (def.data || def.options || []).map(function(option) {
+      return typeof option === "object" ? option : { title: String(option), value: String(option) }
+    })
+  }
+
+  function cycleArgument(index, step) {
+    var def = window.argDefs[index], options = window.argumentOptions(def)
+    if (!options.length) return
+    var value = window.argValues[def.name] || ""
+    var at = options.map(function(option) { return String(option.value) }).indexOf(value)
+    var values = Object.assign({}, window.argValues)
+    values[def.name] = String(options[(at + step + options.length) % options.length].value)
+    window.argValues = values
+  }
+
+  function argumentLabel(def, value) {
+    if (!value) return (def.placeholder || def.name) + (def.required ? "" : " (optional)") + (def.type === "dropdown" ? " ▾" : "")
+    if (def.type === "password" || def.secure) return new Array(value.length + 1).join("•")
+    if (def.type === "dropdown") {
+      var option = window.argumentOptions(def).filter(function(item) { return String(item.value) === value })[0]
+      return (option ? option.title : value) + " ▾"
+    }
+    return value
   }
 
   function askAgent() {
@@ -469,6 +605,7 @@ PanelWindow {
 
   function setQuery(next) {
     if (window.query === next) return
+    window.pendingCommandId = ""
     window.query = next
     window.historyIndex = -1
     window.rebuild(true)
@@ -482,6 +619,7 @@ PanelWindow {
     if (!text) return
     if (window.actionPanelOpen) actionPanel.item.filter += text
     else if (window.argFocus >= 0) {
+      if (window.argDefs[window.argFocus].type === "dropdown") return
       var name = window.argDefs[window.argFocus].name
       var values = Object.assign({}, window.argValues)
       values[name] = (values[name] || "") + text
@@ -576,6 +714,13 @@ PanelWindow {
     if (ctrl && key === Qt.Key_Minus) { window.setZoom(window.zoom - 0.1); return true }
     if (ctrl && key === Qt.Key_0) { window.setZoom(1); return true }
     if (ctrl && key === Qt.Key_BracketLeft) { window.closePopups(); window.pop(); return true }
+    if (ctrl && key === Qt.Key_Comma) {
+      window.backend.emit("settings.openRequested", { page: shift ? "commands" : "general",
+        commandId: shift && window.selectedRow ? window.selectedRow.itemId : "" })
+      return true
+    }
+    if (window.view.kind === "script-output")
+      return outputView.item && outputView.item.handleKey ? outputView.item.handleKey(event) : false
     // Ctrl+V, Ctrl+Shift+V (the terminal habit) and Shift+Insert paste.
     var meta = (event.modifiers & Qt.MetaModifier) !== 0
     if ((key === Qt.Key_V && ctrl && !alt && !meta) || (key === Qt.Key_Insert && shift && !ctrl && !alt && !meta)) {
@@ -633,8 +778,9 @@ PanelWindow {
       if (key === Qt.Key_PageDown) { window.move(8); return true }
       if (ctrl && shift && key === Qt.Key_F) { window.performIfOffered(["favorite-add", "favorite-remove"]); return true }
       if (ctrl && shift && key === Qt.Key_C) { window.performIfOffered(["copy-command", "copy-id", "copy-question-answer"]); return true }
+      if (ctrl && !shift && key === Qt.Key_E) { window.performIfOffered(["quicklink-edit"]); return true }
       if (ctrl && shift && key === Qt.Key_D) { window.performIfOffered(["delete-all-entries"]); return true }
-      if (ctrl && key === Qt.Key_D) { window.performIfOffered(["delete-entry"]); return true }
+      if (ctrl && key === Qt.Key_D) { window.performIfOffered(["delete-entry", "quicklink-delete"]); return true }
       if (alt && shift && key === Qt.Key_D) { window.performIfOffered(["disable"]); return true }
       if (ctrl && key >= Qt.Key_1 && key <= Qt.Key_9) {
         var target = window.nthItem(key - Qt.Key_0)
@@ -659,6 +805,11 @@ PanelWindow {
     function onCandidatesRevisionChanged() { if (window.shown && !window.actionPanelOpen && !window.alert) window.rebuild(false) }
     function onNotification(method, data) {
       if (method === "agent.launchFailed" && window.shown) window.showToast("failure", data.message)
+      if (method === "general.showToast") {
+        if (window.shown) window.showToast(data.style, data.title, data.actions)
+        else window.hud(data.title || "")
+      }
+      if (method === "general.showHUD") window.hud(data.text || data.title || "")
     }
     // Exchange rates or zone offsets arrived: re-evaluate a calculation on screen.
     function onCalculatorRevisionChanged() { if (window.shown && !window.actionPanelOpen && window.query) window.rebuild(false) }
@@ -673,7 +824,7 @@ PanelWindow {
   BorderSurface {
     id: card
     width: window.cardWidth
-    height: window.compact ? window.headerHeight + card.borderTop + card.borderBottom : window.fullHeight
+    height: window.compact ? window.headerHeight + (window.compactFavorites.length ? window.px(48) : 0) + card.borderTop + card.borderBottom : window.fullHeight
     radius: Math.max(Style.cornerRadius, window.px(8))
     anchors.horizontalCenter: parent.horizontalCenter
     y: Math.max(Style.gapsOut, Math.min(Math.round(window.height / 4), window.height - window.fullHeight - Style.gapsOut))
@@ -735,7 +886,7 @@ PanelWindow {
         id: queryText
         textFormat: Text.PlainText
         x: lead.x + lead.width + window.px(12)
-        width: Math.min(implicitWidth, header.queryRoom - (pills.visible ? pills.width + window.px(10) : 0))
+        width: Math.max(0, Math.min(implicitWidth, header.queryRoom - (pills.visible ? pills.width + window.px(10) : 0)))
         anchors.verticalCenter: parent.verticalCenter
         text: window.query || (pills.visible ? "" : window.placeholder)
         color: window.look.foreground
@@ -751,7 +902,7 @@ PanelWindow {
         anchors.verticalCenter: parent.verticalCenter
         x: queryText.x + (window.query ? Math.min(queryText.contentWidth, queryText.width) + Style.space(1) : 0)
         color: window.look.accent
-        visible: window.shown && !window.actionPanelOpen && window.argFocus < 0
+        visible: window.shown && !window.actionPanelOpen && window.argFocus < 0 && window.view.kind !== "script-output"
 
         SequentialAnimation on opacity {
           running: window.shown
@@ -780,7 +931,7 @@ PanelWindow {
             readonly property string value: window.argValues[modelData.name] || ""
             readonly property bool focused: window.argFocus === index
             height: window.px(28)
-            width: Math.min(window.px(220), pillText.implicitWidth + window.px(20))
+            width: Math.min(window.px(window.argDefs.length > 1 ? 150 : 220), pillText.implicitWidth + window.px(20))
             radius: Math.max(Style.cornerRadius, window.px(6))
             color: Util.alpha(window.look.foreground, pill.focused ? 0.12 : 0.06)
             border.width: 1
@@ -794,7 +945,7 @@ PanelWindow {
               anchors.rightMargin: window.px(10)
               anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
-              text: pill.value || (pill.modelData.placeholder + (pill.modelData.required ? "" : " (optional)"))
+              text: window.argumentLabel(pill.modelData, pill.value)
               opacity: pill.value ? 1 : 0.5
               color: window.look.foreground
               elide: Text.ElideLeft
@@ -813,8 +964,12 @@ PanelWindow {
 
             MouseArea {
               anchors.fill: parent
-              cursorShape: Qt.IBeamCursor
-              onClicked: { window.argFocus = pill.index; keyCatcher.forceActiveFocus() }
+              cursorShape: pill.modelData.type === "dropdown" ? Qt.PointingHandCursor : Qt.IBeamCursor
+              onClicked: {
+                window.argFocus = pill.index
+                if (pill.modelData.type === "dropdown") window.cycleArgument(pill.index, 1)
+                keyCatcher.forceActiveFocus()
+              }
             }
           }
         }
@@ -874,6 +1029,50 @@ PanelWindow {
       }
     }
 
+    Flickable {
+      visible: window.compact && window.compactFavorites.length > 0
+      anchors.top: header.bottom
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.margins: window.px(12)
+      height: window.px(36)
+      contentWidth: favoriteChips.width
+      clip: true
+      Row {
+        id: favoriteChips
+        spacing: window.px(8)
+        Repeater {
+          model: window.compactFavorites
+          Rectangle {
+            required property var modelData
+            width: Math.min(window.px(180), favoriteTitle.implicitWidth + window.px(20))
+            height: window.px(30)
+            radius: window.px(5)
+            color: Util.alpha(window.look.foreground, 0.08)
+            Text {
+              id: favoriteTitle
+              anchors.fill: parent
+              anchors.margins: window.px(6)
+              text: modelData.title
+              textFormat: Text.PlainText
+              elide: Text.ElideRight
+              color: window.look.foreground
+              font.family: window.look.fontFamily
+              font.pixelSize: Math.round(Style.font.bodySmall * window.zoom)
+            }
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                if (modelData.arguments && modelData.arguments.length) window.promptCommand(modelData)
+                else window.request({ id: modelData.id, action: "open", query: "" })
+              }
+            }
+          }
+        }
+      }
+    }
+
     Item {
       id: body
       visible: !window.compact
@@ -884,12 +1083,21 @@ PanelWindow {
       anchors.leftMargin: card.borderLeft + window.px(8)
       anchors.rightMargin: card.borderRight + window.px(8)
 
+      Loader {
+        id: outputView
+        anchors.fill: parent
+        active: window.view.kind === "script-output"
+        sourceComponent: ScriptOutputView {
+          backend: window.backend
+          runId: window.view.runId || ""
+        }
+      }
       ListView {
         id: list
         anchors.fill: parent
         anchors.topMargin: window.px(4)
         anchors.bottomMargin: window.px(4)
-        visible: window.view.kind !== "alias"
+        visible: window.view.kind !== "alias" && window.view.kind !== "script-output"
         clip: true
         model: rows
         reuseItems: true
@@ -910,7 +1118,7 @@ PanelWindow {
       Column {
         anchors.centerIn: parent
         spacing: window.px(8)
-        visible: window.view.kind === "alias" || rows.count === 0
+        visible: window.view.kind !== "script-output" && (window.view.kind === "alias" || rows.count === 0)
 
         Text {
           anchors.horizontalCenter: parent.horizontalCenter

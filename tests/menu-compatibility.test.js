@@ -30,7 +30,8 @@ function harness(tree) {
     recordVisit: (id, query) => visits.push({ id, query }),
     summonPlugin: (id, payload) => summons.push({ id, payload: JSON.parse(payload) })
   }
-  const context = vm.createContext({ backend, menuSource: { tree }, OmarchyMenu })
+  const context = vm.createContext({ backend, menuSource: { tree }, settingsStore: { loaded: true, doc: { commands: {} } }, OmarchyMenu, RootSearch })
+  backend.actionCandidate = backendFunction("actionCandidate", "id, query", context)
   backend.openMenu = backendFunction("openMenu", "item", context)
   const perform = backendFunction("performAction", "data", context)
   return { summons, visits, open: id => JSON.parse(JSON.stringify(perform({ id }))) }

@@ -69,14 +69,17 @@ test("serialize round-trips through parse", () => {
   assert.deepEqual(Migrate.parse(Migrate.serialize(doc)).doc, doc)
 })
 
-test("shipped settings migrations are valid and use Raycast defaults", () => {
-  const r = Migrate.migrate(null, Schema.settingsMigrations, 1)
-  assert.equal(r.doc.schemaVersion, Schema.settingsMigrations.length)
-  assert.equal(r.doc.general.popToRootTimeout, 90)
-  assert.equal(r.doc.general.escapeKeyBehavior, "pop-back-or-close")
-  assert.equal(r.doc.general.windowPresentationMode, "mouse-screen")
-  assert.equal(r.doc.general.uiZoom, 1)
-  assert.deepEqual(r.doc.commands, {})
+test("Phase 2 upgrade preserves command personalization and general settings", () => {
+  const old = Migrate.migrate(null, Schema.settingsMigrations.slice(0, 1), 1).doc
+  old.general.windowMode = "compact"
+  old.commands = { "app:firefox": { alias: "web", enabled: false, favoriteOrder: 2 } }
+  const upgraded = Migrate.migrate(old, Schema.settingsMigrations, 2).doc
+  assert.deepEqual(upgraded.general, old.general)
+  assert.deepEqual(upgraded.commands, old.commands)
+  upgraded.fallbackIds = []
+  upgraded.scriptDirectories = ["/tmp/personal-scripts"]
+  upgraded.quicklinkPreferences.passSelectedTextAsArgument = true
+  assert.deepEqual(Migrate.migrate(upgraded, Schema.settingsMigrations, 3).doc, upgraded)
 })
 
 test("config keeps known keys of the right type and drops the rest", () => {

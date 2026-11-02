@@ -13,14 +13,19 @@ import "core/OmarchyMenu.js" as OmarchyMenu
 import "core/RootSearch.js" as RootSearch
 import "core/Agent.js" as Agent
 import "core/Calculator.js" as Calculator
+import "core/SystemActions.js" as SystemActions
 import "services"
 
 Item {
   id: backend
 
   readonly property string version: "0.1.0"
-  readonly property var paths: Paths.resolve(function(name) { return Quickshell.env(name) })
+  readonly property var paths: backend.pathOverrides || Paths.resolve(function(name) { return Quickshell.env(name) })
   readonly property string desktop: Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE") ? "hyprland" : "unknown"
+  property string ipcTarget: "oma-cast"
+  property string ipcConfigPath: ""
+  property var pathOverrides: null
+  property alias scriptCommandsService: scripts
 
   property var appLibrary: null
   property var summon: null
@@ -96,6 +101,7 @@ Item {
     for (var i = 0; i < apps.length; i++) if (apps[i] && apps[i].id) next.push(RootSearch.appCandidate(apps[i]))
     next = next.concat(RootSearch.menuCandidates(menuSource.tree, menuSource.guards, menuSource.providerItems, backend.deps))
     for (var b = 0; b < RootSearch.BUILTINS.length; b++) next.push(RootSearch.builtinCandidate(RootSearch.BUILTINS[b]))
+    next = next.concat(quicklinks.candidates, scripts.candidates, systemActions.candidates)
     var byId = ({})
     for (var j = 0; j < next.length; j++) byId[next[j].id] = next[j]
     var entries = FleaSearch.entries(next, Ranker.transliterate)
@@ -118,13 +124,37 @@ Item {
       commands: settingsStore.loaded ? settingsStore.doc.commands : ({}),
       frecency: frecencyStore.loaded ? frecencyStore.doc.items : ({}),
       nowMs: Date.now(),
-      sensitivity: settingsStore.loaded ? settingsStore.doc.general.rootSearchSensitivity : "medium"
+      sensitivity: settingsStore.loaded ? settingsStore.doc.general.rootSearchSensitivity : "medium",
+      fallbackIds: settingsStore.loaded ? settingsStore.doc.fallbackIds : null
     }
   }
 
   function decorated(id) {
     var c = backend.candidatesById[id]
     return c ? RootSearch.decorate(c, backend.searchContext(), backend.deps) : null
+  }
+
+  function fallback(id) {
+    return RootSearch.fallbackCommands(backend.candidates).filter(function(f) { return f.id === id })[0] || null
+  }
+
+  function actionCandidate(id, query) {
+    if (String(id).indexOf("url:") === 0) {
+      var rows = RootSearch.urlRows(query)
+      for (var i = 0; i < rows.length; i++) if (rows[i].candidate.id === id) return rows[i].candidate
+      return null
+    }
+    return backend.decorated(id)
+  }
+
+  function writableSettings() {
+    if (!settingsStore.loaded || settingsStore.readOnly)
+      throw new Error("Settings are unavailable or read-only: " + settingsStore.lastError)
+  }
+
+  function scriptDirectories() {
+    var saved = settingsStore.loaded ? settingsStore.doc.scriptDirectories : null
+    return Array.isArray(saved) ? saved.slice() : [backend.paths.scriptCommands]
   }
 
   // ------------------------------------------------------------ calculator
@@ -225,6 +255,7 @@ Item {
   }
 
   function updateCommand(id, mutator) {
+    backend.writableSettings()
     settingsStore.update(function(doc) {
       var current = doc.commands[id] || {}
       var next = mutator(JSON.parse(JSON.stringify(current)))
@@ -261,8 +292,24 @@ Item {
     var id = String(data && data.id || "")
     var action = String(data && data.action || "open")
     var query = String(data && data.query || "").trim()
-    var candidate = backend.decorated(id)
+    var candidate = backend.actionCandidate(id, query)
     if (!candidate) throw new Error("Unknown command " + id)
+    var saved = settingsStore.loaded && settingsStore.doc.commands[id]
+    if (saved && saved.enabled === false) throw new Error("Command is disabled")
+    if (action === "configure") return { settings: { page: "commands", commandId: id } }
+    if (candidate.kind === "quicklink" && (action === "open" || action.indexOf("quicklink-") === 0))
+      return quicklinks.execute(candidate, data)
+    if (candidate.kind === "script" && action === "open") return scripts.execute(candidate, data)
+    if (candidate.kind === "system-action" && action === "open") {
+      var outcome = systemActions.execute(candidate, data)
+      backend.recordVisit(id, query)
+      return outcome
+    }
+    if (candidate.kind === "url" && action === "open") {
+      if (id === "url:create-quicklink") return { quicklinks: { mode: "create", url: candidate.url } }
+      Util.execArgv(["omarchy-launch-browser", candidate.url])
+      return { close: true }
+    }
 
     if (action === "open") {
       switch (candidate.kind) {
@@ -273,6 +320,7 @@ Item {
         case "omarchy-action":
           if (candidate.disabled) return { toast: { style: "failure", title: candidate.title + " is already set up" } }
           backend.recordVisit(id, query)
+          if (SystemActions.handles(id)) return systemActions.execute(candidate, data)
           backend.runShell(candidate.action)
           return { close: true }
         case "omarchy-menu":
@@ -293,6 +341,13 @@ Item {
             return { close: true }
           }
           backend.recordVisit(id, query)
+          if (candidate.run.settings) return { settings: { page: candidate.run.settings } }
+          if (candidate.run.quicklinks) return { quicklinks: { mode: candidate.run.quicklinks } }
+          if (candidate.run.scriptEditor) return { scriptEditor: {} }
+          if (candidate.run.reloadScripts) {
+            scripts.rescan()
+            return { toast: { style: "success", title: "Reloading script commands" } }
+          }
           if (candidate.run.push) return { push: candidate.run.push }
           if (candidate.run.summon) backend.summonPlugin(candidate.run.summon, candidate.run.payload || "{}")
           return { close: true }
@@ -379,6 +434,13 @@ Item {
       getPaths: function() { return backend.paths }
     })
 
+    Rpc.register(backend.registry, "general", {
+      openSettings: function(data) {
+        backend.emit("settings.openRequested", { page: String(data && data.page || "general"), commandId: String(data && data.commandId || "") })
+        return null
+      }
+    })
+
     Rpc.register(backend.registry, "settings", {
       getGeneralSettings: function() {
         if (!settingsStore.loaded) throw new Error("settings not loaded")
@@ -394,6 +456,9 @@ Item {
           if (typeof patch[key] !== typeof current[key]) throw new Error("Setting " + key + " must be a " + typeof current[key])
           var choices = Schema.generalChoices[key]
           if (choices && choices.indexOf(patch[key]) < 0) throw new Error("Setting " + key + " must be one of " + choices.join(", "))
+          if (typeof patch[key] === "number" && (!isFinite(patch[key])
+              || (key === "uiZoom" ? patch[key] < 0.7 || patch[key] > 2 : patch[key] < 0 || patch[key] > 180)))
+            throw new Error("Setting " + key + " is outside the supported range")
         }
         settingsStore.update(function(doc) { for (var k in patch) doc.general[k] = patch[k] })
         backend.emit("settings.generalSettingsChanged", settingsStore.doc.general)
@@ -401,9 +466,71 @@ Item {
       },
       getAllCommandSettings: function() { return settingsStore.doc.commands },
       getCommandSettings: function(data) { return settingsStore.doc.commands[String(data && data.commandId || "")] || {} },
+      getCommands: function() {
+        return backend.candidates.map(function(c) {
+          var s = settingsStore.loaded ? settingsStore.doc.commands[c.id] || {} : {}
+          return { id: c.id, title: c.title, subtitle: c.subtitle || "", type: c.type, kind: c.kind,
+            alias: s.alias || "", enabled: s.enabled !== false, hotkey: s.hotkey || null,
+            favoriteOrder: s.favoriteOrder, fallbackOrder: s.fallbackOrder }
+        })
+      },
+      getFallbackCommands: function() {
+        var ids = backend.searchContext().fallbackIds || ["fallback:google", "fallback:duckduckgo", "fallback:agent"]
+        return RootSearch.fallbackCommands(backend.candidates).map(function(f) {
+          return { id: f.id, title: f.title, enabled: ids.indexOf(f.id) >= 0, order: ids.indexOf(f.id) }
+        }).sort(function(a, b) {
+          if (a.enabled !== b.enabled) return a.enabled ? -1 : 1
+          return a.enabled ? a.order - b.order : a.title.localeCompare(b.title)
+        })
+      },
+      setFallbackCommands: function(data) {
+        backend.writableSettings()
+        var ids = data && data.ids
+        if (!Array.isArray(ids)) throw new Error("ids must be an ordered array of fallback IDs")
+        var available = RootSearch.fallbackCommands(backend.candidates).map(function(f) { return f.id })
+        ids.forEach(function(id, index) {
+          if (available.indexOf(id) < 0 || ids.indexOf(id) !== index) throw new Error("Unknown or duplicate fallback " + id)
+        })
+        settingsStore.update(function(doc) { doc.fallbackIds = ids.slice() })
+        backend.emit("settings.commandSettingsChanged", {})
+        return ids
+      },
+      getScriptDirectories: function() { return { directories: backend.scriptDirectories() } },
+      updateScriptDirectories: function(data) {
+        backend.writableSettings()
+        var directories = data && data.directories
+        if (!Array.isArray(directories)) throw new Error("directories must be an array")
+        directories = directories.map(function(path) {
+          path = String(path)
+          if (path.indexOf("~/") === 0) path = backend.paths.home + path.slice(1)
+          if (path.charAt(0) !== "/" || /[\x00\r\n]/.test(path)) throw new Error("Script folders must be absolute paths")
+          return path.replace(/\/+$/, "") || "/"
+        }).filter(function(path, index, all) { return all.indexOf(path) === index })
+        settingsStore.update(function(doc) { doc.scriptDirectories = directories })
+        scripts.rescan()
+        return { directories: directories }
+      },
+      getQuicklinkPreferences: function() {
+        return settingsStore.loaded ? settingsStore.doc.quicklinkPreferences
+          : { showPreviews: true, passSelectedTextAsArgument: false }
+      },
+      updateQuicklinkPreferences: function(data) {
+        backend.writableSettings()
+        var patch = data || {}
+        Object.keys(patch).forEach(function(key) {
+          if (["showPreviews", "passSelectedTextAsArgument"].indexOf(key) < 0 || typeof patch[key] !== "boolean")
+            throw new Error("Invalid quicklink preference " + key)
+        })
+        settingsStore.update(function(doc) { doc.quicklinkPreferences = Object.assign({}, doc.quicklinkPreferences, patch) })
+        backend.emit("settings.quicklinkPreferencesChanged", settingsStore.doc.quicklinkPreferences)
+        return settingsStore.doc.quicklinkPreferences
+      },
       updateCommandSettings: function(data) {
         var id = String(data && data.commandId || "")
         if (!backend.candidatesById[id]) throw new Error("Unknown command " + id)
+        backend.writableSettings()
+        if (data.enabled !== undefined && typeof data.enabled !== "boolean") throw new Error("enabled must be boolean")
+        if (data.alias !== undefined && data.alias !== null && typeof data.alias !== "string") throw new Error("alias must be text")
         if (data.alias !== undefined && data.alias !== null) {
           var alias = String(data.alias).trim().toLowerCase()
           if (/\s/.test(alias)) throw new Error("An alias cannot contain spaces")
@@ -411,6 +538,11 @@ Item {
           for (var other in commands) {
             if (other !== id && commands[other].alias === alias && alias) throw new Error("Alias “" + alias + "” is already used by " + ((backend.candidatesById[other] || {}).title || other))
           }
+        }
+        if (data.hotkey !== undefined || (data.enabled !== undefined && (settingsStore.doc.commands[id] || {}).hotkey)) {
+          var patch = Object.assign({}, data)
+          if (patch.hotkey === undefined) patch.hotkey = settingsStore.doc.commands[id].hotkey
+          return hotkeys.setCommand(patch)
         }
         backend.updateCommand(id, function(s) {
           if (data.alias !== undefined) { if (data.alias) s.alias = String(data.alias).trim().toLowerCase(); else delete s.alias }
@@ -430,6 +562,8 @@ Item {
         var sections
         if (view && view.kind === "menu") sections = RootSearch.submenuSections(backend.candidates, view.menuId, query, ctx, backend.deps)
         else if (view && view.kind === "calculator-history") sections = RootSearch.historySections(calculatorStore.doc.history, query, ctx.nowMs, Calculator.filterHistory)
+        else if (view && view.kind === "quicklinks") sections = RootSearch.providerSections(backend.candidates, "quicklink", query, ctx, backend.deps)
+        else if (view && view.kind === "scripts") sections = RootSearch.providerSections(backend.candidates, "script", query, ctx, backend.deps)
         else {
           ctx.filter = String(data && data.filter || "all")
           if (query.trim() && ctx.filter === "all") ctx.calculation = backend.calculate(query)
@@ -443,13 +577,16 @@ Item {
         var rowId = String(data && data.id || "")
         if (rowId === RootSearch.CALCULATOR_ID) return RootSearch.actionsFor({ kind: "calculator" })
         if (rowId.indexOf("calculator-history:") === 0) return RootSearch.actionsFor({ kind: "calculator-history" })
+        if (rowId.indexOf("url:") === 0) return RootSearch.actionsFor({ kind: "url", title: rowId === "url:open" ? "Open in Browser" : "Create Quicklink" })
         var candidate = backend.decorated(rowId)
         if (!candidate) {
-          var fallback = RootSearch.FALLBACKS.filter(function(f) { return f.id === data.id })[0]
+          var fallback = backend.fallback(data.id)
           if (!fallback) throw new Error("Unknown command " + (data && data.id))
           return RootSearch.actionsFor({ kind: "fallback", title: fallback.title })
         }
-        return RootSearch.actionsFor(candidate)
+        var actions = RootSearch.actionsFor(candidate)
+        if (candidate.kind === "quicklink") actions = actions.concat(quicklinks.actions(candidate))
+        return actions
       },
       getItemInfo: function(data) {
         var rowId = String(data && data.id || "")
@@ -462,9 +599,9 @@ Item {
           var entry = backend.historyEntry(rowId)
           return entry ? RootSearch.aboutFor(RootSearch.historyCandidate(entry, nowMs), nowMs) : []
         }
-        var candidate = backend.decorated(rowId)
+        var candidate = backend.actionCandidate(rowId, String(data.query || ""))
         if (!candidate) {
-          var f = RootSearch.FALLBACKS.filter(function(x) { return x.id === rowId })[0]
+          var f = backend.fallback(rowId)
           if (!f) throw new Error("Unknown command " + rowId)
           return RootSearch.aboutFor({ id: f.id, kind: "fallback", title: f.title, typeLabel: "Fallback", url: f.url }, nowMs)
         }
@@ -476,11 +613,17 @@ Item {
           var confirm = RootSearch.confirmationFor(String(data && data.id || ""), String(data && data.action || "open"))
           if (confirm) return { confirm: confirm }
         }
-        var fallback = RootSearch.FALLBACKS.filter(function(f) { return f.id === (data && data.id) })[0]
+        var fallback = backend.fallback(data && data.id)
         if (fallback) {
           if (fallback.id === Agent.FALLBACK_ID) {
             agentLauncher.start(data.query)
             return { pending: true }
+          }
+          if (fallback.view) return { push: { kind: fallback.view, title: fallback.title, query: String(data.query || "") } }
+          if (fallback.targetId) {
+            var values = {}
+            values[fallback.argument] = String(data.query || "")
+            return backend.performAction({ id: fallback.targetId, action: "open", query: String(data.query || ""), arguments: values })
           }
           Util.execArgv(["omarchy-launch-browser", RootSearch.fallbackUrl(fallback, data.query)])
           return { close: true }
@@ -532,6 +675,10 @@ Item {
         return entry ? { anchor: entry.anchor, openedAt: entry.openedAt, score: Frecency.score(entry.anchor, Date.now() / 1000), searchTerms: entry.searchTerms } : null
       }
     })
+    quicklinks.initialize()
+    scripts.initialize()
+    hotkeys.initialize()
+    systemActions.initialize()
   }
 
   Component.onCompleted: {
@@ -571,6 +718,29 @@ Item {
     id: agentLauncher
     onPrepared: function(argv) { backend.emit("agent.launchReady", { argv: argv }) }
     onFailed: function(message) { backend.emit("agent.launchFailed", { message: message }) }
+  }
+
+  QuicklinksService {
+    id: quicklinks
+    backend: parent
+    onCandidatesChanged: rebuildTimer.restart()
+  }
+
+  ScriptCommandsService {
+    id: scripts
+    backend: parent
+    onCandidatesChanged: rebuildTimer.restart()
+  }
+
+  HotkeysService {
+    id: hotkeys
+    backend: parent
+  }
+
+  SystemActionsService {
+    id: systemActions
+    backend: parent
+    onCandidatesChanged: rebuildTimer.restart()
   }
 
 

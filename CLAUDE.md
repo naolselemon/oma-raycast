@@ -69,15 +69,19 @@ Rules for `plugin/core/*.js`: one self-contained file per module (QML `import "x
 node --test tests/*.test.js   # unit tests (node's built-in runner; no npm install)
 mise x act@latest -- act push   # run .github/workflows/ci.yml locally in Docker (.actrc maps the WarpBuild label)
 tests/smoke.sh               # live checks: doctor, IPC, toggle latency (<100 ms). Shows/hides the launcher, never types.
+OMA_CAST_QML_RUNNER=/usr/bin/qs node --test tests/*.test.js  # also run the opt-in QML cases
 omarchy plugin validate plugin
 
 bin/oma-cast install         # link plugin into ~/.config/omarchy/plugins, enable it, link CLI into ~/.local/bin
 bin/oma-cast reload          # pick up QML/JS edits (see "Reloading" below)
 bin/oma-cast dev             # reload on every save under plugin/ (needs inotifywait)
+bin/oma-cast preview         # separate host + profile; does not replace the installed plugin
+bin/oma-cast preview show    # from another terminal; preview settings / preview stop also work
 bin/oma-cast uninstall
 
 oma-cast toggle | show | hide
 oma-cast run <commandId>             # Phase 1+
+oma-cast settings [page]             # general, launcher, keyboard, commands, quicklinks, scripts, about
 oma-cast call <method> [json]        # any backend method, e.g. oma-cast call system.info
 oma-cast doctor
 oma-cast setup hyprland              # writes ~/.config/hypr/oma-cast.lua (Alt+Space) and requires it from hyprland.lua
@@ -105,7 +109,7 @@ Check each of these on the machine instead of assuming it; Omarchy changes often
 
 Renamed **raylinux → oma-launcher → oma-cast** on 2026-10-19 (plugin `typecraft.oma-cast`, CLI `oma-cast`, IPC target and global shortcut `oma-cast:toggle`, XDG dirs `oma-cast`). The app icon is Omarchy's logo: glyph `\ue900` in the `omarchy` font, the same one the bar's menu button uses.
 
-**Phase 1 (Quickshell build): done**, with the gaps listed below. **Phase 0: done.** Omarchy 4.0.0.alpha, Quickshell 0.3.2, Hyprland 0.56.2.
+**Phases 0–2 (Quickshell build): implemented.** Phase 2 functional acceptance was exercised on the live desktop on 2026-11-02 in a separate preview host/profile. The current CLI latency limitation and intentionally unexecuted system actions are recorded below and in SPEC §12. Earlier Phase 0/1 baseline: Omarchy 4.0.0.alpha, Quickshell 0.3.2, Hyprland 0.56.2.
 
 Works:
 - **Root search** ported from ref 02 §4.2–4.6 (`core/Ranker.js`, `core/Frecency.js`, golden tests). Sections (`core/RootSearch.js`):
@@ -146,11 +150,25 @@ Works:
 - **Latency:** show → mapped in 59–66 ms, hide in 24–42 ms on Omarchy 4.0.6 (`tests/smoke.sh`; it was 37–44 ms on the old `OverlayWindow`).
 - **Tests:** root search, calculator and default-agent hand-off coverage (`node --test tests/*.test.js`).
 
+**Phase 2 additions (2026-11-02):**
+- Native **Settings** (Ctrl+,), with General, Launcher, Keyboard, Commands / Extensions, Quicklinks, Script Commands and About. The commands table includes disabled items and saves alias/enabled/hotkey edits together; Ctrl+Shift+, configures the selected search row. Compact favorites and mouse/active/primary-screen placement are implemented.
+- **Per-command hotkeys:** Hyprland Lua handles, conflict rejection, rollback and reload reconciliation; no config rewrites or broad unbinding. Saved in `db/settings.json`. Hyper-key remapping remains user-owned.
+- **Quicklinks:** native creation/edit/delete and JSON import/export, `db/quicklinks.json`, tags/icons/open counts, argument pills/defaults/dropdowns, current clipboard/selection, date/UUID/calculator placeholders and modifiers. Explicit same-origin favicon fetching requires confirmation. Root URL actions and ordered fallbacks include single-argument quicklinks. Clipboard-history and nested-snippet placeholders remain unavailable until their own phases.
+- **Script Commands:** executable-file discovery, configurable directories, Bash/Python creation, literal arguments, login-shell environment, working directory, confirmation, full-output/compact/silent/inline modes, masked arguments, ANSI rendering, cancel/copy/rerun. Poll directories every 15 s, inline refresh at least 10 s; cap four simultaneous runs, eight completed runs and 128 KiB output / 2,000 displayed lines. macOS-only utilities in third-party scripts need Linux adaptation.
+- **System actions:** wpctl volume/mute/microphone, MPRIS playback/track controls, Omarchy audio panel, Lua display sleep and real opposite-mode theme selection. Existing power commands retain their guards and confirmations.
+- **Verification:** 187 standard tests + two opt-in QML tests passed; all eight native transport scenarios passed. Live checks covered quicklink CRUD, actual argument launching/import/export/favicon fetch, Bash/Python four-mode execution/cancellation and UI creation, hotkey activation/conflict/reload, safe unchanged-value audio control and real mpv media control. Calculator and menu search regressions passed. See SPEC §12 for sample provenance and limits.
+- **Live limits:** destructive power/display actions and real theme switching were not executed; multi-monitor placement remains unverified. Native windows work, but the preview reports a duplicate application-ID portal warning. Current five-sample warm CLI measurements: installed show 238–279 ms / hide 168–188 ms; preview show 235–276 ms / hide 142–204 ms. Both exceed the historical <100 ms target; these measurements include CLI startup and do not establish global-shortcut latency.
+- **Safe preview:** `oma-cast preview` uses its own process, `oma-cast-preview` IPC/layer target and data under `~/.cache/oma-cast-preview` (override with `OMA_CAST_PREVIEW_HOME`). It does not install the branch. Desktop commands still affect the real session. Stop/start after source edits. Do not install or reload the stable plugin just to test a branch.
+
+Qt notes: use `QtQuick.Controls.Basic` with the live Omarchy palette; unqualified `Color` collides with a Controls singleton. Native settings/editor windows need `transientParent: null` because the plugin's root Item is not their visual parent. Force launcher keyboard focus after its backing window maps, not only before the screen probe completes.
+
+Hotkey smoke note: wtype uses a synthetic keymap; Hyprland's default physical-key bind resolution does not match it. A temporary rule for only `hl-virtual-keyboard-wtype` with `resolve_binds_by_sym=true` allowed the live global-hotkey test. Compositor reload removed that test rule and verified saved-hotkey restoration; no persistent keyboard config was changed.
+
 **Default-agent hand-off (fork, 2026-10-20):** user-authorized addition outside the original phase plan. The root fallback "Ask default agent" and Ctrl+Alt+Enter pass the query to `omarchy-agent --prompt` as a literal argv element. `AgentLauncher.qml` checks the configured agent/terminal with a bounded, question-free preflight, prevents overlapping submissions and cancels on hide/unload. `Launcher.qml` dismisses the overlay before launching through `Util.execArgv`. Errors leave the query visible. There are no new dependencies, model APIs, credentials or question-history writes. Existing CLI approval behaviour is inherited. Portable checks do not establish live terminal focus, authentication, or provider compatibility; verify those on Omarchy.
 
-Stubbed / not yet:
-- No settings window, so you can't re-enable a disabled command except with Undo on the toast (Ctrl+T) or by editing `~/.local/share/oma-cast/db/settings.json` (delete its `enabled: false`). That's Phase 2.
-- No deep links (`oma-cast://`); Phase 2 or 9.
+Not yet:
+- Clipboard history, snippets, extension runtime, indexed file search and the other Phase 3–9 features in SPEC §12.
+- No `oma-cast://` / `raycast://` deep-link handler yet (Phase 9).
 
 Won't do (decided 2026-10-22):
 - Keystroke buffering. Keys sent within ~40 ms of the hotkey go to the window underneath; fixing it needs a parked surface, which Omarchy avoids (SPEC §12 Phase 1).

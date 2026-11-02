@@ -30,6 +30,7 @@ Launcher
   show | hide            Show or hide it
   run <commandId>        Open a command directly
   call <method> [json]   Call a backend method, e.g. oma-cast call system.info
+  settings [page]         Open settings (general, launcher, keyboard, commands, quicklinks, scripts)
 
 Setup
   build-search           Build the optional flea-search helper (needs Rust/cargo)
@@ -37,6 +38,7 @@ Setup
   uninstall              Disable and unlink the plugin
   reload                 Make the shell reload the plugin after editing it
   dev                    Reload the plugin on every save under plugin/
+  preview [command]      Run/test this checkout separately; isolated data, no install or live reload
   setup hyprland         Bind Alt+Space to the launcher in ~/.config/hypr/oma-cast.lua
   doctor                 Check that the pieces are in place
 USAGE
@@ -169,6 +171,8 @@ case "${1:-}" in
   toggle|show|hide) need_shell; ipc "$1" >/dev/null ;;
   run) need_shell; [[ -n ${2:-} ]] || die "usage: oma-cast run <commandId>"; ipc run "$2" ;;
   call) need_shell; [[ -n ${2:-} ]] || die "usage: oma-cast call <method> [json]"; ipc call "$2" "${3:-}" ;;
+  settings) need_shell; ipc settings "${2:-general}" ;;
+  preview) shift; "$repo/bin/oma-cast-preview" "$@" ;;
   ping) need_shell; ipc ping ;;
   build-search) "$repo/bin/build-search" ;;
   install) cmd_install ;;

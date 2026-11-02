@@ -1,0 +1,34 @@
+#!/bin/bash
+set -euo pipefail
+
+repo=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+export OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+export OMA_CAST_PREVIEW_HOME="${OMA_CAST_PREVIEW_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/oma-cast-preview}"
+OMA_CAST_PREVIEW_HOME=$(realpath -m -- "$OMA_CAST_PREVIEW_HOME")
+export OMA_CAST_PREVIEW_HOME
+config="$OMA_CAST_PREVIEW_HOME/shell"
+
+case "${1:-start}" in
+  start)
+    command -v qs >/dev/null || { echo 'Quickshell is required' >&2; exit 1; }
+    [[ -d $OMARCHY_PATH/shell/Commons ]] || { echo 'Omarchy shell components are missing' >&2; exit 1; }
+    if qs ipc -n -p "$config" call -- oma-cast-preview ping 2>/dev/null | grep -qx ok; then
+      echo 'Preview is already running. Use: oma-cast preview show' >&2
+      exit 1
+    fi
+    mkdir -p -- "$config"
+    for directory in Commons Ui services; do ln -sfn -- "$OMARCHY_PATH/shell/$directory" "$config/$directory"; done
+    ln -sfn -- "$repo/plugin" "$config/Plugin"
+    cp -- "$repo/dev/preview.qml" "$config/shell.qml"
+    printf 'Isolated preview data: %s\n' "$OMA_CAST_PREVIEW_HOME"
+    printf 'Open with: %q preview show\n' "$repo/bin/oma-cast"
+    printf 'Stop with Ctrl+C or: %q preview stop\n' "$repo/bin/oma-cast"
+    exec qs -p "$config"
+    ;;
+  stop) exec qs kill -p "$config" ;;
+  call) [[ -n ${2:-} ]] || { echo 'Usage: oma-cast preview call <method> [json]' >&2; exit 1; }; exec qs ipc -n -p "$config" call -- oma-cast-preview call "$2" "${3:-}" ;;
+  settings) exec qs ipc -n -p "$config" call -- oma-cast-preview settings "${2:-general}" ;;
+  search|run) [[ -n ${2:-} ]] || { echo "Usage: oma-cast preview $1 <value>" >&2; exit 1; }; exec qs ipc -n -p "$config" call -- oma-cast-preview "$1" "$2" ;;
+  show|hide|toggle|ping|isOpen) exec qs ipc -n -p "$config" call -- oma-cast-preview "$1" ;;
+  *) echo 'Usage: oma-cast preview [start|stop|show|hide|toggle|settings [page]|search <query>|run <id>|call <method> [json]]' >&2; exit 1 ;;
+esac

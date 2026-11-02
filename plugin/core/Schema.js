@@ -18,6 +18,16 @@ var settingsMigrations = [
       doc.commands = {}
       return doc
     }
+  },
+  {
+    version: 2,
+    name: "phase-two-command-preferences",
+    up: function(doc) {
+      doc.fallbackIds = ["fallback:google", "fallback:duckduckgo", "fallback:agent"]
+      doc.scriptDirectories = null
+      doc.quicklinkPreferences = { showPreviews: true, passSelectedTextAsArgument: false }
+      return doc
+    }
   }
 ]
 
@@ -83,6 +93,8 @@ var configChoices = {
 
 var generalChoices = {
   windowMode: ["expanded", "compact"],
+  windowPresentationMode: ["mouse-screen", "active-screen", "primary-screen"],
+  theme: ["omarchy"],
   escapeKeyBehavior: ["pop-back-or-close", "close-and-pop-to-root"],
   navigationBindings: ["emacs", "vim-motions"],
   rootSearchSensitivity: ["low", "medium", "high"]
